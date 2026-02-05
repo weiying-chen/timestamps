@@ -2,7 +2,7 @@
 """Insert SRT timestamp ranges above matching Chinese blocks in a DOCX.
 
 Usage:
-  .venv/bin/python add_timestamps.py input.docx input.srt output.docx
+  python3 add_timestamps.py input.docx input.srt output.docx
 """
 import argparse
 import re
