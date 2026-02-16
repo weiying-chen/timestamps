@@ -12,6 +12,7 @@ from xml.etree import ElementTree as ET
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 NS = {"w": W_NS}
+TIME_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})(?:[,:](\d{2,3}))?$")
 
 
 def normalize(text: str) -> str:
@@ -156,18 +157,81 @@ def parse_ts_range(ts: str):
     return start, end
 
 
-def make_timestamp_paragraph(ts_text: str):
+def to_mmss(ts: str) -> str:
+    m = TIME_RE.match(ts.strip())
+    if not m:
+        return "0000"
+    hours = int(m.group(1))
+    minutes = int(m.group(2))
+    seconds = int(m.group(3))
+    total_minutes = hours * 60 + minutes
+    return f"{total_minutes:02d}{seconds:02d}"
+
+
+def make_timestamp_paragraph(start_label: str, end_label: str, separator: str, highlight: bool):
     p = ET.Element(f"{{{W_NS}}}p")
-    r = ET.SubElement(p, f"{{{W_NS}}}r")
-    t = ET.SubElement(r, f"{{{W_NS}}}t")
-    t.text = ts_text
+
+    def append_run(text: str, highlighted: bool) -> None:
+        r = ET.SubElement(p, f"{{{W_NS}}}r")
+        r_pr = ET.SubElement(r, f"{{{W_NS}}}rPr")
+        ET.SubElement(
+            r_pr,
+            f"{{{W_NS}}}rFonts",
+            {
+                f"{{{W_NS}}}ascii": "Calibri",
+                f"{{{W_NS}}}cs": "Calibri",
+                f"{{{W_NS}}}eastAsia": "Calibri",
+                f"{{{W_NS}}}hAnsi": "Calibri",
+            },
+        )
+        if highlighted:
+            ET.SubElement(r_pr, f"{{{W_NS}}}highlight", {f"{{{W_NS}}}val": "green"})
+        ET.SubElement(r_pr, f"{{{W_NS}}}rtl", {f"{{{W_NS}}}val": "0"})
+        t = ET.SubElement(r, f"{{{W_NS}}}t")
+        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        t.text = text
+
+    def append_tab_run() -> None:
+        r = ET.SubElement(p, f"{{{W_NS}}}r")
+        r_pr = ET.SubElement(r, f"{{{W_NS}}}rPr")
+        ET.SubElement(
+            r_pr,
+            f"{{{W_NS}}}rFonts",
+            {
+                f"{{{W_NS}}}ascii": "Calibri",
+                f"{{{W_NS}}}cs": "Calibri",
+                f"{{{W_NS}}}eastAsia": "Calibri",
+                f"{{{W_NS}}}hAnsi": "Calibri",
+            },
+        )
+        ET.SubElement(r_pr, f"{{{W_NS}}}rtl", {f"{{{W_NS}}}val": "0"})
+        ET.SubElement(r, f"{{{W_NS}}}tab")
+
+    append_run(start_label, highlighted=highlight)
+    if separator == "tab":
+        append_tab_run()
+    else:
+        append_run(" ", highlighted=False)
+    append_run(end_label, highlighted=highlight)
+    if separator == "tab":
+        append_tab_run()
     return p
 
 
-def insert_timestamps(root, paras_text, para_to_range, ts_sep: str):
+def insert_timestamps(root, paras_text, para_to_range, label_style: str, separator: str, highlight: bool):
     body = root.find(".//w:body", NS)
     if body is None:
         return root
+
+    ordered = sorted(para_to_range.items(), key=lambda x: x[0])
+    para_to_label = {}
+    for idx, (para_i, (start, end)) in enumerate(ordered, start=1):
+        if label_style == "numbered":
+            start_mmss = to_mmss(start)
+            end_mmss = to_mmss(end)
+            para_to_label[para_i] = (f"{idx}_{start_mmss}", f"{idx}_{end_mmss}")
+        else:
+            para_to_label[para_i] = (start, end)
 
     # rebuild body children with inserted timestamp paragraphs
     new_children = []
@@ -175,10 +239,16 @@ def insert_timestamps(root, paras_text, para_to_range, ts_sep: str):
     for child in list(body):
         if child.tag == f"{{{W_NS}}}p":
             para_index += 1
-            if para_index in para_to_range:
-                start, end = para_to_range[para_index]
-                ts_text = f"{start}{ts_sep}{end}"
-                new_children.append(make_timestamp_paragraph(ts_text))
+            if para_index in para_to_label:
+                start_label, end_label = para_to_label[para_index]
+                new_children.append(
+                    make_timestamp_paragraph(
+                        start_label,
+                        end_label,
+                        separator=separator,
+                        highlight=highlight,
+                    )
+                )
         new_children.append(child)
 
     body[:] = new_children
@@ -194,9 +264,26 @@ def main():
     parser.add_argument("--report", default=None, help="Optional report path (txt)")
     parser.add_argument("--max-window", type=int, default=8, help="Max SRT lines per paragraph window")
     parser.add_argument("--lookahead", type=int, default=6, help="How far ahead (in SRT lines) to search")
+    parser.add_argument(
+        "--label-style",
+        choices=["raw", "numbered"],
+        default="raw",
+        help="Timestamp label style: raw start/end values or numbered N_MMSS",
+    )
+    parser.add_argument(
+        "--separator",
+        choices=["space", "tab"],
+        default="space",
+        help="Separator between start/end labels (space or tab)",
+    )
+    parser.add_argument(
+        "--no-highlight",
+        action="store_true",
+        help="Do not apply highlight to inserted timestamp labels",
+    )
     args = parser.parse_args()
 
-    srt_items, ts_sep = parse_srt(args.srt)
+    srt_items, _ts_sep = parse_srt(args.srt)
     if not srt_items:
         raise SystemExit("SRT is empty or invalid.")
 
@@ -299,7 +386,14 @@ def main():
         else:
             adjusted_para_to_ts[insert_i] = (start, end)
 
-    root = insert_timestamps(root, paras, adjusted_para_to_ts, ts_sep)
+    root = insert_timestamps(
+        root,
+        paras,
+        adjusted_para_to_ts,
+        args.label_style,
+        args.separator,
+        not args.no_highlight,
+    )
 
     # write new docx
     with zipfile.ZipFile(args.docx) as zin:
